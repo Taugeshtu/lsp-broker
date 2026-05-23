@@ -32,6 +32,32 @@ cargo install --path . --root ~/.local
 
 This puts `lsp-broker` in `~/.local/bin/`.
 
+## making it run automatically on your system
+The best way to run lsp-broker is as a user systemd service.
+Write the following into `~/.config/systemd/user/lsp-broker.service`:
+
+```ini
+[Unit]
+Description=LSP-servers broker-manager
+After=niri.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lsp-broker --daemon
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start the service:
+```bash
+systemctl --user enable lsp-broker --now
+```
+
 ## Configuration
 
 Configurations live in `~/.config/lsp-broker/config.toml`. If missing, the broker falls back to default commands for Rust, Python, Go, and Markdown.

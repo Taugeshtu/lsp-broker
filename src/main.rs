@@ -280,6 +280,29 @@ async fn process_editor_message(
     Ok(())
 }
 
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut bytes_iter = s.as_bytes().iter();
+    while let Some(&b) = bytes_iter.next() {
+        if b == b'%' {
+            let h1 = bytes_iter.next().copied();
+            let h2 = bytes_iter.next().copied();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or("00"), 16) {
+                    bytes.push(val);
+                    continue;
+                }
+            }
+            bytes.push(b'%');
+            if let Some(x) = h1 { bytes.push(x); }
+            if let Some(x) = h2 { bytes.push(x); }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
+}
+
 async fn handle_query_connection(
     stream: UnixStream,
     multiplexer: Arc<Multiplexer>,
@@ -299,7 +322,9 @@ async fn handle_query_connection(
         .and_then(|u| u.as_str())
         .ok_or_else(|| anyhow!("Query missing textDocument.uri"))?;
     
-    let path_str = uri.trim_start_matches("file://");
+    let raw_path = uri.trim_start_matches("file://");
+    let decoded_path = percent_decode(raw_path);
+    let path_str = &decoded_path;
     let project_root = workspace::find_project_root(path_str);
     
     // Detect language from extension or shebang
