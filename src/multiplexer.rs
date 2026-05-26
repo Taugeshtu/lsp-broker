@@ -28,6 +28,7 @@ pub struct ServerInstance {
     pub id_mapping: HashMap<u64, (ClientId, Value)>, // server_id -> (client_id, client_req_id)
     pub next_server_id: u64,
     pub cached_capabilities: Option<Value>,
+    pub initialized: bool,
     pub last_activity: Instant,
 }
 
@@ -108,6 +109,7 @@ impl Multiplexer {
             id_mapping: HashMap::new(),
             next_server_id: 1,
             cached_capabilities: None,
+            initialized: false,
             last_activity: Instant::now(),
         }));
 

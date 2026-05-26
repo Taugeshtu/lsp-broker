@@ -1,8 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -226,7 +225,10 @@ async fn process_editor_message(
     }
     
     if method == "initialized" {
-        // Drop initialized notification to avoid double initializing
+        if !server.initialized {
+            server.initialized = true;
+            write_lsp_message(&mut server.stdin, msg).await?;
+        }
         return Ok(());
     }
     
@@ -320,6 +322,7 @@ async fn handle_query_connection(
         .and_then(|p| p.get("textDocument"))
         .and_then(|t| t.get("uri"))
         .and_then(|u| u.as_str())
+        .map(|u| u.to_string())
         .ok_or_else(|| anyhow!("Query missing textDocument.uri"))?;
     
     let raw_path = uri.trim_start_matches("file://");
@@ -352,7 +355,7 @@ async fn handle_query_connection(
         }
     }
     
-    let server_instance = multiplexer.get_or_spawn_server(project_root, language, &server_cmd).await?;
+    let server_instance = multiplexer.get_or_spawn_server(project_root, language.clone(), &server_cmd).await?;
     
     // 2. Perform on-demand initialization if necessary
     {
@@ -402,6 +405,7 @@ async fn handle_query_connection(
             });
             let body = serde_json::to_string(&initialized_notif)?;
             write_lsp_message(&mut server.stdin, &body).await?;
+            server.initialized = true;
         }
     }
     
@@ -409,6 +413,30 @@ async fn handle_query_connection(
     let client_id = multiplexer.get_client_id().await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     
+    let needs_temp_open = {
+        let server = server_instance.lock().await;
+        !server.open_documents.contains_key(&uri)
+    };
+    
+    if needs_temp_open {
+        let file_content = std::fs::read_to_string(path_str).unwrap_or_default();
+        let did_open = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri.clone(),
+                    "languageId": language,
+                    "version": 1,
+                    "text": file_content
+                }
+            }
+        });
+        let mut server = server_instance.lock().await;
+        let open_body = serde_json::to_string(&did_open)?;
+        write_lsp_message(&mut server.stdin, &open_body).await?;
+    }
+
     // Temporarily register this client to receive the response
     {
         let mut server = server_instance.lock().await;
@@ -438,6 +466,22 @@ async fn handle_query_connection(
         let mut server = server_instance.lock().await;
         server.clients.remove(&client_id);
         server.last_activity = Instant::now();
+    }
+
+    if needs_temp_open {
+        let did_close = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {
+                "textDocument": {
+                    "uri": uri
+                }
+            }
+        });
+        let mut server = server_instance.lock().await;
+        if let Ok(close_body) = serde_json::to_string(&did_close) {
+            let _ = write_lsp_message(&mut server.stdin, &close_body).await;
+        }
     }
     
     if let Ok(Some(resp_msg)) = response {
