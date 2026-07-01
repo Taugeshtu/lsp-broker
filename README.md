@@ -62,6 +62,9 @@ systemctl --user enable lsp-broker --now
 
 Configurations live in `~/.config/lsp-broker/config.toml`. If missing, the broker falls back to default commands for Rust, Python, Go, and Markdown.
 
+> [!IMPORTANT]
+> When running `lsp-broker` as a systemd user service, it does not inherit your shell's interactive `$PATH` (e.g. `~/.cargo/bin`). You **must** specify absolute paths to your server commands.
+
 Example:
 ```toml
 [languages]
@@ -69,10 +72,10 @@ rs = "rust"
 md = "markdown"
 
 [servers.rust]
-command = ["rust-analyzer"]
+command = ["/home/user/.cargo/bin/rust-analyzer"]
 
 [servers.markdown]
-command = ["markdown-oxide"]
+command = ["/home/user/.cargo/bin/markdown-oxide"]
 ```
 
 ## Version history
