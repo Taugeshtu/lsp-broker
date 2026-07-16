@@ -33,39 +33,52 @@ pub struct ServerInstance {
 }
 
 pub struct Multiplexer {
-    pub servers: Arc<Mutex<HashMap<(PathBuf, String), Arc<Mutex<ServerInstance>>>>>,
+    pub workspaces: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<crate::workspace::Workspace>>>>>,
     pub next_client_id: Arc<Mutex<ClientId>>,
 }
 
 impl Multiplexer {
     pub fn new() -> Self {
-        let servers: Arc<Mutex<HashMap<(PathBuf, String), Arc<Mutex<ServerInstance>>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let workspaces: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<crate::workspace::Workspace>>>>> = Arc::new(Mutex::new(HashMap::new()));
         
         // Spawn the idle server reaping task
-        let servers_clone = servers.clone();
+        let workspaces_clone = workspaces.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                let mut lock = servers_clone.lock().await;
-                let mut to_remove = Vec::new();
+                let mut workspaces_lock = workspaces_clone.lock().await;
+                let mut workspaces_to_remove = Vec::new();
                 
-                for (key, server_mutex) in lock.iter() {
-                    let mut server = server_mutex.lock().await;
-                    if server.clients.is_empty() && server.last_activity.elapsed() > Duration::from_secs(15 * 60) {
-                        println!("Killing idle server for language '{}' at {:?}", key.1, key.0);
-                        let _ = server.child.kill().await;
-                        to_remove.push(key.clone());
+                for (root, workspace_mutex) in workspaces_lock.iter() {
+                    let mut workspace = workspace_mutex.lock().await;
+                    let mut servers_to_remove = Vec::new();
+                    
+                    for (lang, server_mutex) in workspace.servers.iter() {
+                        let mut server = server_mutex.lock().await;
+                        if server.clients.is_empty() && server.last_activity.elapsed() > Duration::from_secs(15 * 60) {
+                            println!("Killing idle server for language '{}' at {:?}", lang, root);
+                            let _ = server.child.kill().await;
+                            servers_to_remove.push(lang.clone());
+                        }
+                    }
+                    
+                    for lang in servers_to_remove {
+                        workspace.servers.remove(&lang);
+                    }
+                    
+                    if workspace.servers.is_empty() {
+                        workspaces_to_remove.push(root.clone());
                     }
                 }
                 
-                for key in to_remove {
-                    lock.remove(&key);
+                for root in workspaces_to_remove {
+                    workspaces_lock.remove(&root);
                 }
             }
         });
 
         Multiplexer {
-            servers,
+            workspaces,
             next_client_id: Arc::new(Mutex::new(1)),
         }
     }
@@ -76,10 +89,19 @@ impl Multiplexer {
         language: String,
         cmd_args: &[String],
     ) -> Result<Arc<Mutex<ServerInstance>>> {
-        let mut servers = self.servers.lock().await;
-        let key = (project_root.clone(), language.clone());
-
-        if let Some(server) = servers.get(&key) {
+        let mut workspaces = self.workspaces.lock().await;
+        
+        let workspace_arc = workspaces.entry(project_root.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(crate::workspace::Workspace {
+                root: project_root.clone(),
+                servers: HashMap::new(),
+            })))
+            .clone();
+            
+        drop(workspaces); // Release workspaces lock while we lock the workspace / spawn
+        
+        let mut workspace = workspace_arc.lock().await;
+        if let Some(server) = workspace.servers.get(&language) {
             return Ok(server.clone());
         }
 
@@ -134,7 +156,7 @@ impl Multiplexer {
             }
         });
 
-        servers.insert(key, server_instance.clone());
+        workspace.servers.insert(language, server_instance.clone());
         Ok(server_instance)
     }
 
@@ -198,9 +220,12 @@ async fn handle_server_message(server: &mut ServerInstance, msg: &str) -> Result
         println!("[lsp-broker] Server error response: {:?}", err);
     }
     
-    if let Some(id_val) = json.get("id") {
-        // It's a response to a request
-        if let Some(server_id) = id_val.as_u64() {
+    let has_id = json.get("id").is_some();
+    let has_method = json.get("method").is_some();
+    
+    if has_id && !has_method {
+        // It's a response to a client request
+        if let Some(server_id) = json.get("id").and_then(|id| id.as_u64()) {
             if let Some((client_id, original_id)) = server.id_mapping.remove(&server_id) {
                 // Cache capabilities when initialize response arrives
                 if server.cached_capabilities.is_none() {
@@ -220,7 +245,7 @@ async fn handle_server_message(server: &mut ServerInstance, msg: &str) -> Result
             }
         }
     } else {
-        // It's a server-to-client notification (e.g. textDocument/publishDiagnostics)
+        // It's a server-to-client request OR a server-to-client notification
         let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
         if method == "textDocument/publishDiagnostics" {
             if let Some(uri) = json.get("params").and_then(|p| p.get("uri")).and_then(|u| u.as_str()) {
@@ -232,7 +257,7 @@ async fn handle_server_message(server: &mut ServerInstance, msg: &str) -> Result
                 }
             }
         } else {
-            // Broadcast standard notifications to all persistent editor clients only
+            // Broadcast standard notifications/requests to all persistent editor clients only
             for client in server.clients.values() {
                 if !client.is_fleeting {
                     let _ = client.tx.send(msg.to_string());

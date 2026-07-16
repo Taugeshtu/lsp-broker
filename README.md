@@ -1,4 +1,4 @@
-> "Because running five `rust-analyzer` processes on the same project is a crime against RAM."
+> Because running five `rust-analyzer` processes on the same project is a crime against RAM.
 
 ## why
 

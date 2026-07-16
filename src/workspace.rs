@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use crate::multiplexer::ServerInstance;
 
 pub fn find_project_root(file_path: &str) -> PathBuf {
     let path = Path::new(file_path);
@@ -60,4 +64,9 @@ pub fn detect_shebang_language(file_path: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub struct Workspace {
+    pub root: PathBuf,
+    pub servers: HashMap<String, Arc<Mutex<ServerInstance>>>,
 }
