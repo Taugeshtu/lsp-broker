@@ -66,7 +66,15 @@ pub fn detect_shebang_language(file_path: &str) -> Option<String> {
     None
 }
 
+pub enum WatcherState {
+    None,
+    Initializing,
+    Ready(notify::RecommendedWatcher),
+}
+
 pub struct Workspace {
     pub root: PathBuf,
     pub servers: HashMap<String, Arc<Mutex<ServerInstance>>>,
+    pub watcher: WatcherState,
 }
+

@@ -25,6 +25,7 @@ pub struct ServerInstance {
     pub stdin: ChildStdin,
     pub clients: HashMap<ClientId, ClientSession>,
     pub open_documents: HashMap<String, usize>, // uri -> count
+    pub document_versions: HashMap<String, i64>, // uri -> version
     pub id_mapping: HashMap<u64, (ClientId, Value)>, // server_id -> (client_id, client_req_id)
     pub next_server_id: u64,
     pub cached_capabilities: Option<Value>,
@@ -83,6 +84,86 @@ impl Multiplexer {
         }
     }
 
+    pub async fn try_start_watcher(workspace_arc: Arc<Mutex<crate::workspace::Workspace>>, project_root: PathBuf) {
+        let mut workspace = workspace_arc.lock().await;
+        if matches!(workspace.watcher, crate::workspace::WatcherState::None) {
+            workspace.watcher = crate::workspace::WatcherState::Initializing;
+            let workspace_arc_clone = workspace_arc.clone();
+            tokio::spawn(async move {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let watcher_res = notify::recommended_watcher(move |res| {
+                    if let Ok(event) = res {
+                        let _ = tx.send(event);
+                    }
+                });
+                match watcher_res {
+                    Ok(mut watcher) => {
+                        let project_root_clone = project_root.clone();
+                        let watch_res = tokio::task::spawn_blocking(move || {
+                            use notify::Watcher;
+                            watcher.watch(&project_root_clone, notify::RecursiveMode::Recursive)
+                                .map(|_| watcher)
+                        }).await;
+                        match watch_res {
+                            Ok(Ok(watcher)) => {
+                                let mut ws = workspace_arc_clone.lock().await;
+                                ws.watcher = crate::workspace::WatcherState::Ready(watcher);
+                                let workspace_arc_clone_2 = workspace_arc_clone.clone();
+                                tokio::spawn(async move {
+                                    while let Some(event) = rx.recv().await {
+                                        if event.kind.is_modify() || event.kind.is_create() {
+                                            for path in event.paths {
+                                                if path.is_file() {
+                                                    Self::handle_file_change(workspace_arc_clone_2.clone(), path).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            _ => {
+                                eprintln!("Failed to watch project root {:?}", project_root);
+                                let mut ws = workspace_arc_clone.lock().await;
+                                ws.watcher = crate::workspace::WatcherState::None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create watcher: {:?}", e);
+                        let mut ws = workspace_arc_clone.lock().await;
+                        ws.watcher = crate::workspace::WatcherState::None;
+                    }
+                }
+            });
+        }
+    }
+
+    pub async fn handle_file_change(workspace_arc: Arc<Mutex<crate::workspace::Workspace>>, path: PathBuf) {
+        let uri = format!("file://{}", path.display());
+        let workspace = workspace_arc.lock().await;
+        for server_mutex in workspace.servers.values() {
+            let mut server = server_mutex.lock().await;
+            if server.open_documents.contains_key(&uri) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let version = server.document_versions.entry(uri.clone()).or_insert(0);
+                    *version += 1;
+                    let next_version = *version;
+                    let change_notif = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/didChange",
+                        "params": {
+                            "textDocument": { "uri": uri.clone(), "version": next_version },
+                            "contentChanges": [{ "text": content }]
+                        }
+                    });
+                    if let Ok(body) = serde_json::to_string(&change_notif) {
+                        let _ = write_lsp_message(&mut server.stdin, &body).await;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn get_or_spawn_server(
         &self,
         project_root: PathBuf,
@@ -95,12 +176,14 @@ impl Multiplexer {
             .or_insert_with(|| Arc::new(Mutex::new(crate::workspace::Workspace {
                 root: project_root.clone(),
                 servers: HashMap::new(),
+                watcher: crate::workspace::WatcherState::None,
             })))
             .clone();
             
         drop(workspaces); // Release workspaces lock while we lock the workspace / spawn
         
         let mut workspace = workspace_arc.lock().await;
+        
         if let Some(server) = workspace.servers.get(&language) {
             return Ok(server.clone());
         }
@@ -128,6 +211,7 @@ impl Multiplexer {
             stdin,
             clients: HashMap::new(),
             open_documents: HashMap::new(),
+            document_versions: HashMap::new(),
             id_mapping: HashMap::new(),
             next_server_id: 1,
             cached_capabilities: None,

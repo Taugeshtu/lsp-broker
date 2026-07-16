@@ -151,7 +151,39 @@ pub async fn handle_query_connection(
     let client_id = multiplexer.get_client_id().await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     
+    let mut file_content = None;
+    
     // Temporarily register this client to receive the response
+    {
+        let mut server = server_instance.lock().await;
+        
+        let is_already_open = server.open_documents.contains_key(&uri);
+        if !is_already_open {
+            if let Ok(content) = std::fs::read_to_string(&decoded_path) {
+                file_content = Some(content.clone());
+                let did_open = json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {
+                        "textDocument": {
+                            "uri": uri.clone(),
+                            "languageId": language,
+                            "version": 1,
+                            "text": content
+                        }
+                    }
+                });
+                let _ = write_lsp_message(&mut server.stdin, &serde_json::to_string(&did_open)?).await;
+            }
+        }
+    }
+    
+    // Sleep briefly to avoid race condition where server has not finished parsing didOpen
+    // before it receives the references query.
+    if file_content.is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    
     {
         let mut server = server_instance.lock().await;
         server.clients.insert(client_id, ClientSession {
@@ -180,6 +212,19 @@ pub async fn handle_query_connection(
         let mut server = server_instance.lock().await;
         server.clients.remove(&client_id);
         server.last_activity = Instant::now();
+        
+        if file_content.is_some() {
+            let did_close = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didClose",
+                "params": {
+                    "textDocument": {
+                        "uri": uri.clone()
+                    }
+                }
+            });
+            let _ = write_lsp_message(&mut server.stdin, &serde_json::to_string(&did_close)?).await;
+        }
     }
     
     if let Ok(Some(resp_msg)) = response {

@@ -35,7 +35,7 @@ pub async fn handle_editor_connection(
         .map(|s| s.command.clone())
         .unwrap_or_default();
     
-    let server_instance = multiplexer.get_or_spawn_server(project_root, handshake.language, &server_cmd).await?;
+    let server_instance = multiplexer.get_or_spawn_server(project_root.clone(), handshake.language, &server_cmd).await?;
     let client_id = multiplexer.get_client_id().await;
     
     // Create channel for writing back to this editor client
@@ -65,6 +65,15 @@ pub async fn handle_editor_connection(
         });
     }
     
+    // Set up file watcher in background if not already started
+    {
+        let workspaces = multiplexer.workspaces.lock().await;
+        if let Some(workspace_arc) = workspaces.get(&project_root) {
+            crate::multiplexer::Multiplexer::try_start_watcher(workspace_arc.clone(), project_root.clone()).await;
+        }
+    }
+
+    
     // 2. Client loop reading standard LSP messages
     let mut socket_reader = BufReader::new(socket_read);
     loop {
@@ -92,6 +101,7 @@ pub async fn handle_editor_connection(
                     *count = count.saturating_sub(1);
                     if *count == 0 {
                         server.open_documents.remove(&file_uri);
+                        server.document_versions.remove(&file_uri);
                         // Forward didClose to LSP server
                         let close_notif = json!({
                             "jsonrpc": "2.0",
@@ -161,6 +171,10 @@ async fn process_editor_message(
             let count = server.open_documents.entry(uri.to_string()).or_insert(0);
             *count += 1;
             
+            if let Some(version) = json.get("params").and_then(|p| p.get("textDocument")).and_then(|t| t.get("version")).and_then(|v| v.as_i64()) {
+                server.document_versions.insert(uri.to_string(), version);
+            }
+            
             if let Some(client) = server.clients.get_mut(&client_id) {
                 client.open_files.push(uri.to_string());
             }
@@ -179,6 +193,7 @@ async fn process_editor_message(
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     server.open_documents.remove(uri);
+                    server.document_versions.remove(uri);
                     write_lsp_message(&mut server.stdin, msg).await?;
                 }
             }
@@ -187,6 +202,13 @@ async fn process_editor_message(
             }
         }
         return Ok(());
+    }
+    if method == "textDocument/didChange" {
+        if let Some(uri) = json.get("params").and_then(|p| p.get("textDocument")).and_then(|t| t.get("uri")).and_then(|u| u.as_str()) {
+            if let Some(version) = json.get("params").and_then(|p| p.get("textDocument")).and_then(|t| t.get("version")).and_then(|v| v.as_i64()) {
+                server.document_versions.insert(uri.to_string(), version);
+            }
+        }
     }
     
     let has_id = json.get("id").is_some();

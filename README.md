@@ -78,6 +78,11 @@ command = ["/home/user/.cargo/bin/rust-analyzer"]
 command = ["/home/user/.cargo/bin/markdown-oxide"]
 ```
 
+
+## Developer Guide
+
+For information on how to build editor plugins or query clients against the `lsp-broker` sockets, see the [Developer Guide](docs/developer_guide.md).
+
 ## Version history
 
 future:
@@ -85,5 +90,11 @@ future:
 - [ ] supporting multiple editors on the same file via faux "synchronization" of buffers by sending edits from one editor to others
 - [ ] multiple lsp-servers per same kind of file?
 
+v0.2.0:
+- [x] Added workspace file watcher for persistent editors (async, non-blocking)
+- [x] Added on-demand content sync for fleeting queries (forces latest content from disk)
+- [x] Upgraded to Rust edition 2024 and latest dependencies
+
 v0.1.0:
 - [x] initial release
+
